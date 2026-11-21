@@ -1,0 +1,34 @@
+#include <windows.h>
+
+// Embedded image assets (ids must match AssetResource in DrawImage.h)
+101 RCDATA "assets/trash.png"
+102 RCDATA "assets/trash_on.png"
+103 RCDATA "assets/opacity.png"
+104 RCDATA "assets/theme.png"
+105 RCDATA "assets/drop.png"
+106 RCDATA "assets/box.png"
+107 RCDATA "assets/web.png"
+108 RCDATA "assets/win.png"
+
+1 VERSIONINFO
+FILEVERSION 0,0,2,0
+PRODUCTVERSION 0,0,2,0
+FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
+FILEFLAGS 0x0L
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_APP
+{
+    BLOCK "StringFileInfo"
+    {
+        BLOCK "040904b0"
+        {
+            VALUE "FileVersion", "0.0.2"
+            VALUE "ProductName", "GarcenLauncher"
+            VALUE "ProductVersion", "0.0.2"
+        }
+    }
+    BLOCK "VarFileInfo"
+    {
+        VALUE "Translation", 0x409, 1200
+    }
+}

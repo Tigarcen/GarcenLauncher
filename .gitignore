@@ -1,0 +1,8 @@
+/*
+!.gitignore
+!assets/
+!design/
+!src/
+!compile_commands.json
+!LICENSE
+!README.md

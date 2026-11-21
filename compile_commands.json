@@ -1,0 +1,32 @@
+[
+  {
+    "directory": ".",
+    "command": "g++ --target=x86_64-w64-windows-gnu -std=c++17 -O2 -Wall -Wextra -DUNICODE -D_UNICODE -c src/main.cpp",
+    "file": "src/main.cpp"
+  },
+  {
+    "directory": ".",
+    "command": "g++ --target=x86_64-w64-windows-gnu -std=c++17 -O2 -Wall -Wextra -DUNICODE -D_UNICODE -c src/DrawImage.cpp",
+    "file": "src/DrawImage.cpp"
+  },
+  {
+    "directory": ".",
+    "command": "g++ --target=x86_64-w64-windows-gnu -std=c++17 -O2 -Wall -Wextra -DUNICODE -D_UNICODE -c src/ControlConfig.cpp",
+    "file": "src/ControlConfig.cpp"
+  },
+  {
+    "directory": ".",
+    "command": "g++ --target=x86_64-w64-windows-gnu -std=c++17 -O2 -Wall -Wextra -DUNICODE -D_UNICODE -c src/ActionArea.cpp",
+    "file": "src/ActionArea.cpp"
+  },
+  {
+    "directory": ".",
+    "command": "g++ --target=x86_64-w64-windows-gnu -std=c++17 -O2 -Wall -Wextra -DUNICODE -D_UNICODE -c src/List.cpp",
+    "file": "src/List.cpp"
+  },
+  {
+    "directory": ".",
+    "command": "g++ --target=x86_64-w64-windows-gnu -std=c++17 -O2 -Wall -Wextra -DUNICODE -D_UNICODE -c src/Menu.cpp",
+    "file": "src/Menu.cpp"
+  }
+]
