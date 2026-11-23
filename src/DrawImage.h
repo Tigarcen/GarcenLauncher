@@ -78,6 +78,11 @@ bool DrawExeIcon(
     int destinationWidth,
     int destinationHeight);
 
+// Queue an icon for background extraction so the first time a path is drawn
+// at a new size does not pay for the shell call on the UI thread. Web URLs
+// are ignored (they use the embedded web icon).
+void PrefetchIconSource(const std::wstring& path);
+
 // ========================================
 // Scrollbar
 // ========================================

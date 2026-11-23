@@ -14,7 +14,7 @@
 在项目根目录执行下面这一行命令（先编译版本资源，再编译源码并链接）：
 
 ```powershell
-windres src/version.rc -o version.o; if ($?) { g++ src/main.cpp src/DrawImage.cpp src/ControlConfig.cpp src/ActionArea.cpp src/List.cpp src/Menu.cpp version.o -o GarcenLauncher.exe -std=c++17 -O2 -Wall -Wextra -mwindows -municode -static -static-libgcc -static-libstdc++ -DUNICODE -D_UNICODE -luser32 -lgdi32 -lgdiplus -lwindowsapp -lole32 -lshell32 -lwinmm }
+windres src/version.rc -o version.o; if ($?) { g++ src/main.cpp src/DrawImage.cpp src/ControlConfig.cpp src/ActionArea.cpp src/List.cpp src/Menu.cpp version.o -o GarcenLauncher.exe -std=c++17 -O2 -Wall -Wextra -mwindows -municode -static -static-libgcc -static-libstdc++ -DUNICODE -D_UNICODE -luser32 -lgdi32 -lgdiplus -ldwmapi -lwindowsapp -lole32 -lshell32 -lwinmm }
 ```
 
 #### 图片资源
@@ -28,7 +28,7 @@ PNG 图标通过 [src/version.rc](src/version.rc) 以 `RCDATA` 形式编进 exe�
 如果 g++ 静默失败（无任何报错），原因是 PATH 中 `Git\mingw64\bin` 里的旧版 `libwinpthread-1.dll` 排在工具链之前，缺少 cc1plus 需要的 `clock_gettime64` 导出函数。把工具链目录提到 PATH 最前即可：
 
 ```shell
-PATH="/c/ProgramData/mingw64/mingw64/bin:$PATH" windres src/version.rc -o version.o && PATH="/c/ProgramData/mingw64/mingw64/bin:$PATH" g++ src/main.cpp src/DrawImage.cpp src/ControlConfig.cpp src/ActionArea.cpp src/List.cpp src/Menu.cpp version.o -o GarcenLauncher.exe -std=c++17 -O2 -Wall -Wextra -mwindows -municode -static -static-libgcc -static-libstdc++ -DUNICODE -D_UNICODE -luser32 -lgdi32 -lgdiplus -lwindowsapp -lole32 -lshell32 -lwinmm
+PATH="/c/ProgramData/mingw64/mingw64/bin:$PATH" windres src/version.rc -o version.o && PATH="/c/ProgramData/mingw64/mingw64/bin:$PATH" g++ src/main.cpp src/DrawImage.cpp src/ControlConfig.cpp src/ActionArea.cpp src/List.cpp src/Menu.cpp version.o -o GarcenLauncher.exe -std=c++17 -O2 -Wall -Wextra -mwindows -municode -static -static-libgcc -static-libstdc++ -DUNICODE -D_UNICODE -luser32 -lgdi32 -lgdiplus -ldwmapi -lwindowsapp -lole32 -lshell32 -lwinmm
 ```
 
 ### 功能
@@ -75,7 +75,7 @@ PATH="/c/ProgramData/mingw64/mingw64/bin:$PATH" windres src/version.rc -o versio
 Run the following command in the project root directory (compile the version resource first, then compile and link the source files):
 
 ```powershell
-windres src/version.rc -o version.o; if ($?) { g++ src/main.cpp src/DrawImage.cpp src/ControlConfig.cpp src/ActionArea.cpp src/List.cpp src/Menu.cpp version.o -o GarcenLauncher.exe -std=c++17 -O2 -Wall -Wextra -mwindows -municode -static -static-libgcc -static-libstdc++ -DUNICODE -D_UNICODE -luser32 -lgdi32 -lgdiplus -lwindowsapp -lole32 -lshell32 -lwinmm }
+windres src/version.rc -o version.o; if ($?) { g++ src/main.cpp src/DrawImage.cpp src/ControlConfig.cpp src/ActionArea.cpp src/List.cpp src/Menu.cpp version.o -o GarcenLauncher.exe -std=c++17 -O2 -Wall -Wextra -mwindows -municode -static -static-libgcc -static-libstdc++ -DUNICODE -D_UNICODE -luser32 -lgdi32 -lgdiplus -ldwmapi -lwindowsapp -lole32 -lshell32 -lwinmm }
 ```
 
 #### Image Resources
@@ -89,7 +89,7 @@ PNG icons are embedded into the executable as `RCDATA` through [src/version.rc](
 If `g++` fails silently without displaying any errors, an older `libwinpthread-1.dll` in `Git\mingw64\bin` appears before the toolchain in `PATH` and lacks the `clock_gettime64` export required by `cc1plus`. Prepend the toolchain directory to `PATH` to fix this:
 
 ```shell
-PATH="/c/ProgramData/mingw64/mingw64/bin:$PATH" windres src/version.rc -o version.o && PATH="/c/ProgramData/mingw64/mingw64/bin:$PATH" g++ src/main.cpp src/DrawImage.cpp src/ControlConfig.cpp src/ActionArea.cpp src/List.cpp src/Menu.cpp version.o -o GarcenLauncher.exe -std=c++17 -O2 -Wall -Wextra -mwindows -municode -static -static-libgcc -static-libstdc++ -DUNICODE -D_UNICODE -luser32 -lgdi32 -lgdiplus -lwindowsapp -lole32 -lshell32 -lwinmm
+PATH="/c/ProgramData/mingw64/mingw64/bin:$PATH" windres src/version.rc -o version.o && PATH="/c/ProgramData/mingw64/mingw64/bin:$PATH" g++ src/main.cpp src/DrawImage.cpp src/ControlConfig.cpp src/ActionArea.cpp src/List.cpp src/Menu.cpp version.o -o GarcenLauncher.exe -std=c++17 -O2 -Wall -Wextra -mwindows -municode -static -static-libgcc -static-libstdc++ -DUNICODE -D_UNICODE -luser32 -lgdi32 -lgdiplus -ldwmapi -lwindowsapp -lole32 -lshell32 -lwinmm
 ```
 
 ### Features

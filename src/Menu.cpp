@@ -273,7 +273,7 @@ static void RenderMenu(HWND hwnd)
         graphics.SetCompositingMode(Gdiplus::CompositingModeSourceOver);
         graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
         graphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
-        graphics.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAlias);
+        graphics.SetTextRenderingHint(Gdiplus::TextRenderingHintClearTypeGridFit);
 
         const Gdiplus::RectF bounds(
             0.0f,
@@ -649,7 +649,7 @@ bool CreateTrayIcon(HWND hwnd, HINSTANCE hInstance)
     const bool ownsIcon = hIcon != nullptr;
 
     if (!hIcon)
-        hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+        hIcon = LoadIconW(nullptr, MAKEINTRESOURCEW(32512)); // IDI_APPLICATION
 
     NOTIFYICONDATAW nid = {};
     nid.cbSize           = sizeof(NOTIFYICONDATAW);

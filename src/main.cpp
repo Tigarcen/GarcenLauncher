@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 
+#include <dwmapi.h>
 #include <gdiplus.h>
 #include <mmsystem.h>
 
@@ -225,6 +226,11 @@ double g_viewAnimStartTime = 0.0;
 // Raised only while some animation is being frame-paced, released as soon as
 // the last one settles so an idle launcher stays in deep sleep states.
 bool g_animTimerResolutionHeld = false;
+
+// The UI thread is boosted only while animation frames are being paced, so
+// an all-core workload cannot starve a short transition at normal priority.
+bool g_animThreadPriorityHeld = false;
+int g_animPreviousThreadPriority = THREAD_PRIORITY_NORMAL;
 
 // Frame captured before changing levels. It keeps the old level visible
 // until the transition finishes.
@@ -711,6 +717,28 @@ static void SetAnimationTimerResolution(bool hold)
     g_animTimerResolutionHeld = hold;
 }
 
+static void SetAnimationThreadPriority(bool raise)
+{
+    if (raise == g_animThreadPriorityHeld)
+        return;
+
+    if (raise)
+    {
+        HANDLE thread = GetCurrentThread();
+        const int previous = GetThreadPriority(thread);
+
+        if (!SetThreadPriority(thread, THREAD_PRIORITY_ABOVE_NORMAL))
+            return;
+
+        g_animPreviousThreadPriority = previous;
+        g_animThreadPriorityHeld = true;
+        return;
+    }
+
+    SetThreadPriority(GetCurrentThread(), g_animPreviousThreadPriority);
+    g_animThreadPriorityHeld = false;
+}
+
 // ========================================
 // Animation frame clock
 // ========================================
@@ -806,6 +834,63 @@ bool AdvanceAnimations()
     return viewAnimFinished;
 }
 
+// Return the horizontal pixel span of a rounded rect on one scanline.
+// Sampling pixel centres keeps the clip aliased like Graphics::SetClip,
+// while reducing the backdrop restore to a handful of memcpy calls.
+static bool RoundedRectScanlineSpan(
+    const ViewAnimRect& rect,
+    float radius,
+    int y,
+    int frameWidth,
+    int& spanLeft,
+    int& spanRight)
+{
+    const float sampleY = static_cast<float>(y) + 0.5f;
+    const float rectWidth = rect.right - rect.left;
+    const float rectHeight = rect.bottom - rect.top;
+
+    if (rectWidth <= 0.0f || rectHeight <= 0.0f ||
+        sampleY < rect.top || sampleY >= rect.bottom)
+    {
+        return false;
+    }
+
+    const float maxRadius =
+        (rectWidth < rectHeight ? rectWidth : rectHeight) * 0.5f;
+
+    if (radius < 0.0f)
+        radius = 0.0f;
+    else if (radius > maxRadius)
+        radius = maxRadius;
+
+    float inset = 0.0f;
+
+    if (radius > 0.0f)
+    {
+        float cornerY = 0.0f;
+
+        if (sampleY < rect.top + radius)
+            cornerY = rect.top + radius - sampleY;
+        else if (sampleY > rect.bottom - radius)
+            cornerY = sampleY - (rect.bottom - radius);
+
+        if (cornerY > 0.0f)
+        {
+            const float horizontal = std::sqrt(
+                radius * radius - cornerY * cornerY);
+            inset = radius - horizontal;
+        }
+    }
+
+    spanLeft = static_cast<int>(std::ceil(rect.left + inset - 0.5f));
+    spanRight = static_cast<int>(std::ceil(rect.right - inset - 0.5f));
+
+    if (spanLeft < 0) spanLeft = 0;
+    if (spanRight > frameWidth) spanRight = frameWidth;
+
+    return spanLeft < spanRight;
+}
+
 // Composite the captured old level with the new one and outline the
 // transition rect. Entering: old level outside the growing rect, new level
 // inside it. Leaving: parent level underneath, old level inside the
@@ -821,50 +906,70 @@ static void DrawViewAnimationOverlay(
     const ViewAnimRect rect = CurrentTransitionRect();
     const float radius = static_cast<float>(viewArea.radius);
 
-    Gdiplus::GraphicsPath animPath;
-    AddRoundedRectPath(animPath, rect.left, rect.top,
-        rect.right - rect.left, rect.bottom - rect.top, radius);
-
     if (!g_viewAnimBackdrop.empty() &&
         g_viewAnimBackdropWidth == width &&
         g_viewAnimBackdropHeight == height)
     {
-        const Gdiplus::GraphicsState state = graphics.Save();
+        unsigned char* frame = static_cast<unsigned char*>(g_frameBits);
 
-        if (g_viewAnimExpanding)
+        auto copyBackdropSpan = [&](int y, int left, int right) {
+            if (left >= right)
+                return;
+
+            const size_t offset =
+                (static_cast<size_t>(y) * width + left) * 4;
+            memcpy(frame + offset, g_viewAnimBackdrop.data() + offset,
+                static_cast<size_t>(right - left) * 4);
+        };
+
+        const ViewAnimRect viewRect = MakeAnimRect(
+            static_cast<float>(viewArea.left),
+            static_cast<float>(viewArea.top),
+            static_cast<float>(width - viewArea.right),
+            static_cast<float>(height - viewArea.bottom));
+
+        for (int y = 0; y < height; ++y)
         {
-            // Restore the old level only inside the destination viewArea,
-            // excluding the part where the new level has already expanded.
-            Gdiplus::GraphicsPath viewPath;
-            AddRoundedRectPath(viewPath,
-                static_cast<float>(viewArea.left),
-                static_cast<float>(viewArea.top),
-                static_cast<float>(width - viewArea.right - viewArea.left),
-                static_cast<float>(height - viewArea.bottom - viewArea.top),
-                radius);
+            int animLeft = 0;
+            int animRight = 0;
+            const bool animVisible = RoundedRectScanlineSpan(
+                rect, radius, y, width, animLeft, animRight);
 
-            graphics.SetClip(&viewPath, Gdiplus::CombineModeReplace);
-            graphics.SetClip(&animPath, Gdiplus::CombineModeExclude);
+            if (g_viewAnimExpanding)
+            {
+                int viewLeft = 0;
+                int viewRight = 0;
+
+                if (!RoundedRectScanlineSpan(viewRect, radius,
+                        y, width, viewLeft, viewRight))
+                {
+                    continue;
+                }
+
+                if (!animVisible)
+                {
+                    copyBackdropSpan(y, viewLeft, viewRight);
+                    continue;
+                }
+
+                const int leftEnd =
+                    animLeft < viewRight ? animLeft : viewRight;
+                copyBackdropSpan(y, viewLeft, leftEnd);
+
+                const int rightStart =
+                    animRight > viewLeft ? animRight : viewLeft;
+                copyBackdropSpan(y, rightStart, viewRight);
+            }
+            else if (animVisible)
+            {
+                copyBackdropSpan(y, animLeft, animRight);
+            }
         }
-        else
-        {
-            graphics.SetClip(&animPath, Gdiplus::CombineModeReplace);
-        }
-
-        graphics.SetCompositingMode(Gdiplus::CompositingModeSourceCopy);
-
-        Gdiplus::Bitmap backdrop(
-            width,
-            height,
-            width * 4,
-            PixelFormat32bppPARGB,
-            const_cast<BYTE*>(g_viewAnimBackdrop.data()));
-
-        graphics.DrawImage(&backdrop, Gdiplus::Rect(0, 0, width, height),
-            0, 0, width, height, Gdiplus::UnitPixel);
-
-        graphics.Restore(state);
     }
+
+    Gdiplus::GraphicsPath animPath;
+    AddRoundedRectPath(animPath, rect.left, rect.top,
+        rect.right - rect.left, rect.bottom - rect.top, radius);
 
     const bool darkTheme = _wcsicmp(g_config.theme, L"dark") == 0;
     const Gdiplus::Color borderColor = darkTheme
@@ -882,7 +987,13 @@ void DrawFrameContent(int width, int height)
     graphics.SetCompositingMode(Gdiplus::CompositingModeSourceOver);
     graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
     graphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
-    graphics.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAlias);
+    // ClearType, not grayscale AA. Grayscale AA at a 13px CJK size can never
+    // look as crisp as the ClearType text every other app renders, which is
+    // why grid-fitting alone changed nothing visible. ClearType is safe here
+    // because item labels always sit on the opaque window body: the frame DIB
+    // keeps alpha = 255 under the glyphs, so DWM presents the subpixel colours
+    // exactly instead of blending them against an unknown background.
+    graphics.SetTextRenderingHint(Gdiplus::TextRenderingHintClearTypeGridFit);
 
     // During a transition the destination level has already been rendered
     // once. Reuse those pixels so a 16 ms tick never re-queries shell icons,
@@ -891,17 +1002,8 @@ void DrawFrameContent(int width, int height)
         g_viewAnimNewFrameWidth == width &&
         g_viewAnimNewFrameHeight == height)
     {
-        Gdiplus::Bitmap newFrame(
-            width,
-            height,
-            width * 4,
-            PixelFormat32bppPARGB,
-            g_viewAnimNewFrame.data());
-
-        graphics.SetCompositingMode(Gdiplus::CompositingModeSourceCopy);
-        graphics.DrawImage(&newFrame, Gdiplus::Rect(0, 0, width, height),
-            0, 0, width, height, Gdiplus::UnitPixel);
-        graphics.SetCompositingMode(Gdiplus::CompositingModeSourceOver);
+        memcpy(g_frameBits, g_viewAnimNewFrame.data(),
+            static_cast<size_t>(width) * height * 4);
 
         if (g_viewAnimActive)
             DrawViewAnimationOverlay(graphics, width, height);
@@ -1627,24 +1729,6 @@ void DrawDragGhost()
     }
 }
 
-// Scale the already premultiplied frame down to the configured opacity
-void ApplyFrameOpacity(BYTE opacity)
-{
-    unsigned char* pixels = static_cast<unsigned char*>(g_frameBits);
-    const size_t count =
-        static_cast<size_t>(g_frameWidth) * static_cast<size_t>(g_frameHeight);
-
-    for (size_t i = 0; i < count; ++i)
-    {
-        unsigned char* pixel = pixels + i * 4;
-
-        pixel[0] = static_cast<unsigned char>(pixel[0] * opacity / 255);
-        pixel[1] = static_cast<unsigned char>(pixel[1] * opacity / 255);
-        pixel[2] = static_cast<unsigned char>(pixel[2] * opacity / 255);
-        pixel[3] = static_cast<unsigned char>(pixel[3] * opacity / 255);
-    }
-}
-
 void RenderFrame(HWND hwnd)
 {
     if (!hwnd)
@@ -1690,11 +1774,6 @@ void RenderFrame(HWND hwnd)
     // that were underneath it.
     DrawDragGhost();
 
-    const BYTE opacity = static_cast<BYTE>(g_config.opacity * 255.0);
-
-    if (opacity < 255)
-        ApplyFrameOpacity(opacity);
-
     RECT windowRect;
     GetWindowRect(hwnd, &windowRect);
 
@@ -1704,7 +1783,8 @@ void RenderFrame(HWND hwnd)
 
     BLENDFUNCTION blend = {};
     blend.BlendOp = AC_SRC_OVER;
-    blend.SourceConstantAlpha = 255;
+    blend.SourceConstantAlpha =
+        static_cast<BYTE>(g_config.opacity * 255.0);
     blend.AlphaFormat = AC_SRC_ALPHA;
 
     UpdateLayeredWindow(
@@ -2157,7 +2237,7 @@ static void BeginRename(HWND hwnd, RenameTarget target, int itemIndex)
     wc.cbSize = sizeof(wc);
     wc.lpfnWndProc = RenamePopupProc;
     wc.hInstance = GetModuleHandleW(nullptr);
-    wc.hCursor = LoadCursorW(nullptr, IDC_IBEAM);
+    wc.hCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(32513)); // IDC_IBEAM
     wc.lpszClassName = RENAME_POPUP_CLASS;
     RegisterClassExW(&wc); // no-op once registered
 
@@ -3217,7 +3297,7 @@ static bool ShowWebNamePrompt(
     wc.cbSize = sizeof(wc);
     wc.lpfnWndProc = WebNamePromptProc;
     wc.hInstance = GetModuleHandleW(nullptr);
-    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    wc.hCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(32512)); // IDC_ARROW
     wc.lpszClassName = WEB_NAME_PROMPT_CLASS;
     RegisterClassExW(&wc);
 
@@ -4927,6 +5007,7 @@ LRESULT CALLBACK WindowProc(
         KillTimer(hwnd, ITEM_FLASH_TIMER_ID);
         DestroyRenameEditor();
         SetAnimationTimerResolution(false);
+        SetAnimationThreadPriority(false);
         UnregisterHotKey(hwnd, HOTKEY_ID);
         PostQuitMessage(0);
         return 0;
@@ -5122,7 +5203,7 @@ static bool ShowHotkeyPrompt(bool occupied, UINT& modifiers, UINT& key)
     wc.cbSize = sizeof(wc);
     wc.lpfnWndProc = HotkeyPromptProc;
     wc.hInstance = GetModuleHandleW(nullptr);
-    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    wc.hCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(32512)); // IDC_ARROW
     wc.lpszClassName = HOTKEY_PROMPT_CLASS;
 
     RegisterClassExW(&wc);
@@ -5294,6 +5375,21 @@ static void EnsureAutoStart()
     RegCloseKey(key);
 }
 
+// Hand every item path to the background icon prefetcher. Opening a group
+// renders all of its children at 32px for the first time; with the sources
+// already extracted, entering the group never blocks on a shell call.
+static void PrefetchItemIcons(const std::vector<Item>& items)
+{
+    for (const Item& item : items)
+    {
+        if (!item.path.empty())
+            PrefetchIconSource(item.path);
+
+        if (!item.children.empty())
+            PrefetchItemIcons(item.children);
+    }
+}
+
 // ========================================
 // Windows entry point
 // ========================================
@@ -5352,6 +5448,9 @@ int WINAPI wWinMain(
     // Load list.json (create it with [] when missing)
     g_items = InitList();
 
+    // Warm the icon cache off the UI thread
+    PrefetchItemIcons(g_items);
+
     // Working copy of the list used by the UI layer
     ViewItems = g_items;
     // Levels stays empty initially (viewing root)
@@ -5378,7 +5477,7 @@ int WINAPI wWinMain(
     wc.hCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(32512));
     wc.hIcon = g_appIconLarge
         ? g_appIconLarge
-        : LoadIconW(nullptr, IDI_APPLICATION);
+        : LoadIconW(nullptr, MAKEINTRESOURCEW(32512)); // IDI_APPLICATION
     wc.hIconSm = g_appIconSmall ? g_appIconSmall : wc.hIcon;
     wc.style = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS;
 
@@ -5512,9 +5611,10 @@ hotkey_done:
     // is why a scrollbar drag — driven straight from WM_MOUSEMOVE — looked
     // fluid while wheel scrolling and the level transition felt steppy.
     //
-    // Instead, while anything is animating the loop drains input, then emits
-    // at most one frame per monitor refresh, sleeping only until the next
-    // frame is due. When nothing animates it blocks in GetMessage as before.
+    // Instead, while anything is animating the loop drains input, submits a
+    // frame, then lets DwmFlush apply vblank backpressure. If composition is
+    // unavailable it sleeps until the next QPC frame deadline. When nothing
+    // animates it blocks in GetMessage as before.
     MSG msg = {};
     double nextFrameTime = 0.0;
 
@@ -5523,6 +5623,7 @@ hotkey_done:
         if (!AnimationFramesNeeded())
         {
             SetAnimationTimerResolution(false);
+            SetAnimationThreadPriority(false);
 
             if (GetMessageW(&msg, nullptr, 0, 0) <= 0)
                 break;
@@ -5533,6 +5634,7 @@ hotkey_done:
         }
 
         SetAnimationTimerResolution(true);
+        SetAnimationThreadPriority(true);
 
         // Drain every queued message first so input stays responsive and
         // several mouse events collapse into a single presented frame.
@@ -5579,10 +5681,15 @@ hotkey_done:
             g_viewAnimNewFrameHeight = 0;
         }
 
-        nextFrameTime = now + DisplayFrameIntervalSeconds();
+        // Present at the compositor's vblank. If DWM composition is not
+        // available, retain the QPC + Sleep frame clock as a fallback.
+        nextFrameTime = DwmFlush() == S_OK
+            ? 0.0
+            : now + DisplayFrameIntervalSeconds();
     }
 
     SetAnimationTimerResolution(false);
+    SetAnimationThreadPriority(false);
 
     ReleaseFrameBuffer();
 

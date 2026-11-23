@@ -1,6 +1,8 @@
 #include "DrawImage.h"
 
 #include <cstring>
+#include <deque>
+#include <memory>
 #include <vector>
 
 #include "ActionArea.h"
@@ -92,8 +94,11 @@ static Gdiplus::Image* GetPngResourceImage(int resourceId)
             return entry.image;
     }
 
+    // MAKEINTRESOURCEW(10) is RT_RCDATA. Spelling it out keeps this a wide
+    // call even when a toolchain (or the IDE's parser) omits -DUNICODE, which
+    // would otherwise expand RT_RCDATA to its char* form.
     const HRSRC info = FindResourceW(
-        nullptr, MAKEINTRESOURCEW(resourceId), RT_RCDATA);
+        nullptr, MAKEINTRESOURCEW(resourceId), MAKEINTRESOURCEW(10));
 
     if (!info)
         return nullptr;
@@ -265,7 +270,59 @@ static void CacheIconTile(
     g_cachedIconTiles.push_back(std::move(entry));
 }
 
-// SrcOver one premultiplied icon tile onto the frame buffer.
+// SrcOver one already-clipped destination span into the frame buffer.
+static void CompositeIconSpan(
+    const unsigned char* tile,
+    int tileWidth,
+    int destinationX,
+    int destinationY,
+    int left,
+    int top,
+    int right,
+    int bottom)
+{
+    extern void* g_frameBits;
+    extern int g_frameWidth;
+
+    unsigned char* frame = static_cast<unsigned char*>(g_frameBits);
+
+    for (int y = top; y < bottom; ++y)
+    {
+        const unsigned char* s = tile +
+            (static_cast<size_t>(y - destinationY) * tileWidth +
+             (left - destinationX)) * 4;
+        unsigned char* d = frame +
+            (static_cast<size_t>(y) * g_frameWidth + left) * 4;
+
+        for (int x = left; x < right; ++x)
+        {
+            const unsigned char sa = s[3];
+
+            if (sa == 255)
+            {
+                d[0] = s[0]; d[1] = s[1]; d[2] = s[2]; d[3] = 255;
+            }
+            else if (sa != 0)
+            {
+                const int invSa = 255 - sa;
+                d[0] = static_cast<unsigned char>(
+                    s[0] + static_cast<int>(d[0]) * invSa / 255);
+                d[1] = static_cast<unsigned char>(
+                    s[1] + static_cast<int>(d[1]) * invSa / 255);
+                d[2] = static_cast<unsigned char>(
+                    s[2] + static_cast<int>(d[2]) * invSa / 255);
+                d[3] = static_cast<unsigned char>(
+                    sa + static_cast<int>(d[3]) * invSa / 255);
+            }
+
+            s += 4;
+            d += 4;
+        }
+    }
+}
+
+// SrcOver one premultiplied icon tile directly onto the frame buffer. The
+// DC clip region is still honoured, including the rounded viewArea region.
 static bool CompositeIconTile(
     const unsigned char* tile,
     int width,
@@ -273,106 +330,142 @@ static bool CompositeIconTile(
     int destinationX,
     int destinationY)
 {
-    if (!tile || width <= 0 || height <= 0)
-        return false;
-
     extern HDC g_frameDC;
+    extern void* g_frameBits;
+    extern int g_frameWidth;
+    extern int g_frameHeight;
 
-    const HDC screen = GetDC(nullptr);
-
-    BITMAPINFOHEADER bih = {};
-    bih.biSize = sizeof(BITMAPINFOHEADER);
-    bih.biWidth = width;
-    bih.biHeight = -height;
-    bih.biPlanes = 1;
-    bih.biBitCount = 32;
-    bih.biCompression = BI_RGB;
-
-    void* bgBits = nullptr;
-    HBITMAP hBgBmp = CreateDIBSection(
-        screen, reinterpret_cast<BITMAPINFO*>(&bih),
-        DIB_RGB_COLORS, &bgBits, nullptr, 0);
-
-    if (!hBgBmp || !bgBits)
+    if (!tile || width <= 0 || height <= 0 ||
+        !g_frameDC || !g_frameBits ||
+        g_frameWidth <= 0 || g_frameHeight <= 0)
     {
-        BitBlt(g_frameDC, destinationX, destinationY, width, height,
-               nullptr, 0, 0, BLACKNESS);
-        ReleaseDC(nullptr, screen);
         return false;
     }
 
-    HDC bgDC = CreateCompatibleDC(screen);
-    HBITMAP oldBg = static_cast<HBITMAP>(SelectObject(bgDC, hBgBmp));
+    const int boundsLeft = destinationX > 0 ? destinationX : 0;
+    const int boundsTop = destinationY > 0 ? destinationY : 0;
+    const int boundsRight = destinationX + width < g_frameWidth
+        ? destinationX + width : g_frameWidth;
+    const int boundsBottom = destinationY + height < g_frameHeight
+        ? destinationY + height : g_frameHeight;
 
-    BitBlt(bgDC, 0, 0, width, height,
-           g_frameDC, destinationX, destinationY, SRCCOPY);
+    if (boundsLeft >= boundsRight || boundsTop >= boundsBottom)
+        return true;
 
-    // Manual SrcOver in premultiplied BGRA space
-    const unsigned char* s = tile;
-    unsigned char* d = static_cast<unsigned char*>(bgBits);
-    const int pixelCount = width * height;
+    HRGN clipRegion = CreateRectRgn(0, 0, 0, 0);
 
-    for (int i = 0; i < pixelCount; ++i)
+    if (!clipRegion)
+        return false;
+
+    const int clipResult = GetClipRgn(g_frameDC, clipRegion);
+
+    if (clipResult < 0)
     {
-        unsigned char sa = s[3];
-        if (sa == 0)
+        DeleteObject(clipRegion);
+        return false;
+    }
+
+    if (clipResult == 0)
+    {
+        CompositeIconSpan(tile, width, destinationX, destinationY,
+            boundsLeft, boundsTop, boundsRight, boundsBottom);
+        DeleteObject(clipRegion);
+        return true;
+    }
+
+    const DWORD dataSize = GetRegionData(clipRegion, 0, nullptr);
+    bool composited = true;
+
+    if (dataSize > 0)
+    {
+        std::vector<unsigned char> bytes(dataSize);
+        RGNDATA* regionData = reinterpret_cast<RGNDATA*>(bytes.data());
+
+        if (GetRegionData(clipRegion, dataSize, regionData) == dataSize)
         {
-            // background unchanged
-        }
-        else if (sa == 255)
-        {
-            d[0] = s[0]; d[1] = s[1]; d[2] = s[2]; d[3] = 255;
+            const RECT* rects =
+                reinterpret_cast<const RECT*>(regionData->Buffer);
+
+            for (DWORD i = 0; i < regionData->rdh.nCount; ++i)
+            {
+                const int left = rects[i].left > boundsLeft
+                    ? rects[i].left : boundsLeft;
+                const int top = rects[i].top > boundsTop
+                    ? rects[i].top : boundsTop;
+                const int right = rects[i].right < boundsRight
+                    ? rects[i].right : boundsRight;
+                const int bottom = rects[i].bottom < boundsBottom
+                    ? rects[i].bottom : boundsBottom;
+
+                if (left < right && top < bottom)
+                {
+                    CompositeIconSpan(tile, width,
+                        destinationX, destinationY,
+                        left, top, right, bottom);
+                }
+            }
         }
         else
         {
-            int invSa = 255 - sa;
-            d[0] = static_cast<unsigned char>(
-                s[0] + static_cast<int>(d[0]) * invSa / 255);
-            d[1] = static_cast<unsigned char>(
-                s[1] + static_cast<int>(d[1]) * invSa / 255);
-            d[2] = static_cast<unsigned char>(
-                s[2] + static_cast<int>(d[2]) * invSa / 255);
-            d[3] = static_cast<unsigned char>(
-                sa + static_cast<int>(d[3]) * invSa / 255);
+            composited = false;
         }
-        s += 4; d += 4;
     }
 
-    BitBlt(g_frameDC, destinationX, destinationY, width, height,
-           bgDC, 0, 0, SRCCOPY);
-
-    SelectObject(bgDC, oldBg);
-    DeleteDC(bgDC);
-    DeleteObject(hBgBmp);
-    ReleaseDC(nullptr, screen);
-
-    return true;
+    DeleteObject(clipRegion);
+    return composited;
 }
 
-bool DrawExeIcon(
-    Gdiplus::Graphics& graphics,
-    const wchar_t* exePath,
-    int destinationX,
-    int destinationY,
-    int destinationWidth,
-    int destinationHeight)
+// Extracted icon pixels do not depend on the size the icon is drawn at.
+// A group card paints its children at 13px, so without a size-independent
+// cache, opening that group would have to query the shell again for every
+// child at 32px — a visible stall right as the transition starts. Sharing
+// the extracted sources lets every size reuse one shell call.
+struct IconSource
 {
-    (void)graphics; // reserved for future GDI+-only pipeline
+    std::wstring path;
+    int width = 0;
+    int height = 0;
+    std::vector<unsigned char> pixels; // premultiplied BGRA, top-down
+};
 
-    if (!exePath || destinationWidth <= 0 || destinationHeight <= 0)
+// Sources are shared between the UI thread and the prefetch thread, so they
+// are immutable once inserted and handed out as shared_ptr.
+struct IconCacheState
+{
+    CRITICAL_SECTION lock;
+    std::vector<std::shared_ptr<const IconSource>> sources;
+    std::vector<std::wstring> attempted;
+    std::deque<std::wstring> queue;
+    HANDLE wake = nullptr;
+    bool workerStarted = false;
+};
+
+static IconCacheState& IconCache()
+{
+    // Intentionally leaked: the prefetch thread may still be running while
+    // the process tears down its other static objects.
+    static IconCacheState* state = [] {
+        IconCacheState* created = new IconCacheState();
+        InitializeCriticalSection(&created->lock);
+        created->wake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        return created;
+    }();
+
+    return *state;
+}
+
+// -------- Step 1: Get Shell HICON --------
+static bool ExtractIconSource(const wchar_t* exePath, IconSource& out)
+{
+    out.width = 0;
+    out.height = 0;
+    out.pixels.clear();
+
+    if (!exePath)
         return false;
 
-    // Cached tile: skip the shell call and pixel extraction entirely.
-    if (const std::vector<unsigned char>* cachedIcon =
-            FindCachedIconTile(exePath, destinationWidth, destinationHeight))
-    {
-        return CompositeIconTile(
-            cachedIcon->data(),
-            destinationWidth, destinationHeight,
-            destinationX, destinationY);
-    }
+    out.path = exePath;
 
-    // -------- Step 1: Get Shell HICON --------
     HICON iconHandle = nullptr;
     SHFILEINFOW sfi = {};
     if (SHGetFileInfoW(
@@ -489,98 +582,273 @@ bool DrawExeIcon(
         }
     }
 
-    // -------- Step 4: Scale srcPixels into our DIBSection --------
-    const int W = destinationWidth;
-    const int H = destinationHeight;
+    out.width = srcW;
+    out.height = srcH;
+    out.pixels = std::move(srcPixels);
 
-    BITMAPINFOHEADER dstBIH = {};
-    dstBIH.biSize = sizeof(BITMAPINFOHEADER);
-    dstBIH.biWidth = W;
-    dstBIH.biHeight = -H;
-    dstBIH.biPlanes = 1;
-    dstBIH.biBitCount = 32;
-    dstBIH.biCompression = BI_RGB;
+    ReleaseDC(nullptr, screen);
+    return true;
+}
 
-    void* dibBits = nullptr;
-    HBITMAP hDstBmp = CreateDIBSection(
-        screen, reinterpret_cast<BITMAPINFO*>(&dstBIH),
-        DIB_RGB_COLORS, &dibBits, nullptr, 0);
+// -------- Step 4: Scale the cached source to the drawn size --------
+// Pure memory ops in premultiplied BGRA space — zero GDI/DIB/DDB
+// conversion risk, always works.
+static bool BuildIconTile(
+    const IconSource& source,
+    int width,
+    int height,
+    std::vector<unsigned char>& out)
+{
+    const int srcW = source.width;
+    const int srcH = source.height;
 
-    if (!hDstBmp || !dibBits)
+    if (srcW <= 0 || srcH <= 0 || width <= 0 || height <= 0)
+        return false;
+
+    if (source.pixels.size() !=
+        static_cast<size_t>(srcW) * static_cast<size_t>(srcH) * 4)
     {
-        ReleaseDC(nullptr, screen);
         return false;
     }
-    memset(dibBits, 0, static_cast<size_t>(W) * H * 4);
 
-    if (srcW == W && srcH == H)
+    out.assign(static_cast<size_t>(width) * height * 4, 0);
+
+    if (srcW == width && srcH == height)
     {
         // Exact match — direct memcpy
-        memcpy(dibBits, srcPixels.data(), srcPixelBytes);
+        memcpy(out.data(), source.pixels.data(), out.size());
+        return true;
     }
-    else
+
+    unsigned char* dst = out.data();
+    const int srcStride = srcW * 4;
+
+    for (int y = 0; y < height; ++y)
     {
-        // Scale: pixel-area averaging (downscale) / nearest-neighbor
-        // (upscale) in premultiplied BGRA space. Pure memory ops —
-        // zero GDI/DIB/DDB conversion risk, always works.
-        unsigned char* dst = static_cast<unsigned char*>(dibBits);
-        const int srcStride = srcW * 4;
+        // Map dst y to src range [sy0, sy1)
+        const int sy0 = y * srcH / height;
+        int sy1 = (y + 1) * srcH / height;
+        if (sy1 <= sy0) sy1 = sy0 + 1;
+        if (sy1 > srcH) sy1 = srcH;
+        const int syCount = sy1 - sy0;
 
-        for (int y = 0; y < H; ++y)
+        for (int x = 0; x < width; ++x)
         {
-            // Map dst y to src range [sy0, sy1)
-            const int sy0 = y * srcH / H;
-            int sy1 = (y + 1) * srcH / H;
-            if (sy1 <= sy0) sy1 = sy0 + 1;
-            if (sy1 > srcH) sy1 = srcH;
-            const int syCount = sy1 - sy0;
+            const int sx0 = x * srcW / width;
+            int sx1 = (x + 1) * srcW / width;
+            if (sx1 <= sx0) sx1 = sx0 + 1;
+            if (sx1 > srcW) sx1 = srcW;
 
-            for (int x = 0; x < W; ++x)
+            unsigned int sumB = 0, sumG = 0, sumR = 0, sumA = 0;
+            const int total = syCount * (sx1 - sx0);
+
+            for (int sy = sy0; sy < sy1; ++sy)
             {
-                const int sx0 = x * srcW / W;
-                int sx1 = (x + 1) * srcW / W;
-                if (sx1 <= sx0) sx1 = sx0 + 1;
-                if (sx1 > srcW) sx1 = srcW;
-
-                unsigned int sumB = 0, sumG = 0, sumR = 0, sumA = 0;
-                const int total = syCount * (sx1 - sx0);
-
-                for (int sy = sy0; sy < sy1; ++sy)
+                const unsigned char* srcRow =
+                    source.pixels.data() + sy * srcStride;
+                for (int sx = sx0; sx < sx1; ++sx)
                 {
-                    const unsigned char* srcRow =
-                        srcPixels.data() + sy * srcStride;
-                    for (int sx = sx0; sx < sx1; ++sx)
-                    {
-                        const unsigned char* p = srcRow + sx * 4;
-                        sumB += p[0]; sumG += p[1];
-                        sumR += p[2]; sumA += p[3];
-                    }
+                    const unsigned char* p = srcRow + sx * 4;
+                    sumB += p[0]; sumG += p[1];
+                    sumR += p[2]; sumA += p[3];
                 }
-
-                if (total > 0)
-                {
-                    dst[0] = static_cast<unsigned char>(sumB / total);
-                    dst[1] = static_cast<unsigned char>(sumG / total);
-                    dst[2] = static_cast<unsigned char>(sumR / total);
-                    dst[3] = static_cast<unsigned char>(sumA / total);
-                }
-                dst += 4;
             }
+
+            if (total > 0)
+            {
+                dst[0] = static_cast<unsigned char>(sumB / total);
+                dst[1] = static_cast<unsigned char>(sumG / total);
+                dst[2] = static_cast<unsigned char>(sumR / total);
+                dst[3] = static_cast<unsigned char>(sumA / total);
+            }
+            dst += 4;
         }
     }
 
-    // Remember the finished tile so later frames skip extraction.
-    CacheIconTile(exePath, W, H, static_cast<const unsigned char*>(dibBits));
+    return true;
+}
 
-    // -------- Step 5: SrcOver compositing onto g_frameDC --------
-    const bool drawn = CompositeIconTile(
-        static_cast<const unsigned char*>(dibBits),
-        W, H, destinationX, destinationY);
+static bool IsAttemptedPath(
+    const IconCacheState& state,
+    const std::wstring& path)
+{
+    for (const std::wstring& tried : state.attempted)
+    {
+        if (_wcsicmp(tried.c_str(), path.c_str()) == 0)
+            return true;
+    }
 
-    DeleteObject(hDstBmp);
-    ReleaseDC(nullptr, screen);
+    return false;
+}
 
-    return drawn;
+static std::shared_ptr<const IconSource> FindIconSource(const wchar_t* path)
+{
+    IconCacheState& state = IconCache();
+    std::shared_ptr<const IconSource> found;
+
+    EnterCriticalSection(&state.lock);
+
+    for (const auto& source : state.sources)
+    {
+        if (_wcsicmp(source->path.c_str(), path) == 0)
+        {
+            found = source;
+            break;
+        }
+    }
+
+    LeaveCriticalSection(&state.lock);
+    return found;
+}
+
+static void StoreIconSource(std::shared_ptr<const IconSource> source)
+{
+    IconCacheState& state = IconCache();
+
+    EnterCriticalSection(&state.lock);
+
+    if (!IsAttemptedPath(state, source->path))
+        state.attempted.push_back(source->path);
+
+    state.sources.push_back(std::move(source));
+    LeaveCriticalSection(&state.lock);
+}
+
+// Prefetch worker: extracts icons below normal priority so warming the cache
+// never competes with the UI thread or the app the launcher was opened on.
+static DWORD WINAPI IconPrefetchThread(LPVOID)
+{
+    // SHGetFileInfoW can reach the shell namespace, so give the worker its
+    // own apartment. The thread lives until the process exits, which is why
+    // CoUninitialize is never paired with this call.
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+
+    IconCacheState& state = IconCache();
+
+    for (;;)
+    {
+        std::wstring path;
+
+        EnterCriticalSection(&state.lock);
+
+        while (!state.queue.empty())
+        {
+            std::wstring candidate = std::move(state.queue.front());
+            state.queue.pop_front();
+
+            if (IsAttemptedPath(state, candidate))
+                continue;
+
+            state.attempted.push_back(candidate);
+            path = std::move(candidate);
+            break;
+        }
+
+        LeaveCriticalSection(&state.lock);
+
+        if (path.empty())
+        {
+            // No periodic wake-ups: every enqueue signals this event.
+            WaitForSingleObject(state.wake, INFINITE);
+            continue;
+        }
+
+        IconSource extracted;
+
+        if (ExtractIconSource(path.c_str(), extracted))
+        {
+            auto source = std::make_shared<const IconSource>(
+                std::move(extracted));
+
+            EnterCriticalSection(&state.lock);
+            state.sources.push_back(source);
+            LeaveCriticalSection(&state.lock);
+        }
+    }
+
+    return 0;
+}
+
+void PrefetchIconSource(const std::wstring& path)
+{
+    if (path.empty() ||
+        _wcsnicmp(path.c_str(), L"http://", 7) == 0 ||
+        _wcsnicmp(path.c_str(), L"https://", 8) == 0)
+    {
+        return;
+    }
+
+    IconCacheState& state = IconCache();
+
+    EnterCriticalSection(&state.lock);
+
+    if (!state.workerStarted)
+    {
+        HANDLE worker = CreateThread(
+            nullptr, 0, IconPrefetchThread, nullptr, 0, nullptr);
+
+        if (worker)
+        {
+            SetThreadPriority(worker, THREAD_PRIORITY_BELOW_NORMAL);
+            CloseHandle(worker);
+            state.workerStarted = true;
+        }
+    }
+
+    state.queue.push_back(path);
+    LeaveCriticalSection(&state.lock);
+
+    SetEvent(state.wake);
+}
+
+bool DrawExeIcon(
+    Gdiplus::Graphics& graphics,
+    const wchar_t* exePath,
+    int destinationX,
+    int destinationY,
+    int destinationWidth,
+    int destinationHeight)
+{
+    (void)graphics; // reserved for future GDI+-only pipeline
+
+    if (!exePath || destinationWidth <= 0 || destinationHeight <= 0)
+        return false;
+
+    // Cached tile: skip the shell call and pixel extraction entirely.
+    if (const std::vector<unsigned char>* cachedIcon =
+            FindCachedIconTile(exePath, destinationWidth, destinationHeight))
+    {
+        return CompositeIconTile(
+            cachedIcon->data(),
+            destinationWidth, destinationHeight,
+            destinationX, destinationY);
+    }
+
+    // The shell extraction is the expensive part and is size-independent,
+    // so a tile for any size can be built from an already extracted source.
+    std::shared_ptr<const IconSource> source = FindIconSource(exePath);
+
+    if (!source)
+    {
+        IconSource extracted;
+
+        if (!ExtractIconSource(exePath, extracted))
+            return false;
+
+        source = std::make_shared<const IconSource>(std::move(extracted));
+        StoreIconSource(source);
+    }
+
+    std::vector<unsigned char> tile;
+
+    if (!BuildIconTile(*source, destinationWidth, destinationHeight, tile))
+        return false;
+
+    CacheIconTile(exePath, destinationWidth, destinationHeight, tile.data());
+
+    return CompositeIconTile(
+        tile.data(), destinationWidth, destinationHeight,
+        destinationX, destinationY);
 }
 
 // ========================================
